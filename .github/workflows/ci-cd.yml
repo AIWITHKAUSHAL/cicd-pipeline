@@ -1,0 +1,149 @@
+# =============================================================================
+# THE PIPELINE:  GitHub  ->  Testing  ->  Docker Build  ->  Docker Hub  ->  K8s
+# Each arrow in the assignment diagram is one job below, in the same order.
+# =============================================================================
+name: CI/CD Pipeline
+
+# TRIGGER: what makes the pipeline run at all.
+on:
+  push:
+    branches: [main]        # merge to main = release
+  pull_request:
+    branches: [main]        # PRs get tested, but never deployed
+  workflow_dispatch: {}     # manual "Run workflow" button, useful on video
+
+# Values shared by every job. Change the image name in ONE place.
+env:
+  IMAGE_NAME: cicd-demo
+  REGISTRY: docker.io
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB 1 - TESTING.  Runs on every push AND every pull request.
+  # Nothing downstream starts until this is green.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Run automated tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip          # caches ~/.cache/pip between runs
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest -v
+
+  # ---------------------------------------------------------------------------
+  # JOB 2 - DOCKER BUILD + IMAGE PUSH.
+  # `needs: test` is the guardrail: a failing test means this job never starts.
+  # Skipped entirely on pull requests - PRs must not publish images.
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build image and push to Docker Hub
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag from the commit SHA
+        id: meta
+        run: |
+          SHA_SHORT=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          IMAGE="${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
+          echo "sha_short=${SHA_SHORT}"        >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}:${SHA_SHORT}"   >> "$GITHUB_OUTPUT"
+          echo "Will build ${IMAGE}:${SHA_SHORT}"
+
+      # Buildx gives us layer caching that survives between workflow runs.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}   # access token, NOT your password
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.sha_short }}
+          # TWO tags on purpose:
+          #   :<sha>  immutable, this exact commit - what we deploy
+          #   :latest a moving pointer - convenient for humans, never for k8s
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # JOB 3 - KUBERNETES DEPLOYMENT (rolling update).
+  # The cluster is reached with a kubeconfig stored as a GitHub secret.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to Kubernetes
+    needs: build-and-push
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production      # lets you require a manual approval here
+    steps:
+      - uses: actions/checkout@v4
+
+      # Secrets cannot be used in a job-level `if:`, so the guard lives here.
+      - name: Check cluster credentials are configured
+        id: guard
+        run: |
+          if [ -z "${{ secrets.KUBE_CONFIG }}" ]; then
+            echo "No KUBE_CONFIG secret - skipping deploy (fine for a demo repo)."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write kubeconfig
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Apply manifests
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/service.yaml
+          # First deploy only: create the Deployment with a real image.
+          if ! kubectl -n cicd-demo get deploy cicd-demo >/dev/null 2>&1; then
+            sed "s|IMAGE_PLACEHOLDER|${{ needs.build-and-push.outputs.image }}|" \
+              k8s/deployment.yaml | kubectl apply -f -
+          fi
+
+      # This one line is "continuous deployment". Everything above exists
+      # so that this line is safe to run automatically.
+      - name: Roll out the new image
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          kubectl -n cicd-demo set image deploy/cicd-demo \
+            api=${{ needs.build-and-push.outputs.image }}
+          kubectl -n cicd-demo rollout status deploy/cicd-demo --timeout=120s
+
+      # If readiness never goes green, undo automatically. Show this failing
+      # on video by pushing a deliberately broken commit.
+      - name: Roll back if the rollout failed
+        if: failure() && steps.guard.outputs.ready == 'true'
+        run: kubectl -n cicd-demo rollout undo deploy/cicd-demo

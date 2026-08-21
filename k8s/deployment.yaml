@@ -1,0 +1,49 @@
+# The ROLLING UPDATE deployment - this is what the main pipeline updates.
+# The blue-green version lives in k8s/blue-green/ and is the bonus.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cicd-demo
+  namespace: cicd-demo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cicd-demo
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # never drop below 3 healthy pods
+      maxSurge: 1         # add one new pod at a time
+  template:
+    metadata:
+      labels:
+        app: cicd-demo
+    spec:
+      containers:
+        - name: api
+          # IMAGE_PLACEHOLDER is rewritten by the pipeline
+          # (kubectl set image ...), so this file never holds a real tag.
+          image: IMAGE_PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: APP_COLOR
+              value: "blue"
+            # Downward API: Kubernetes tells the pod its own name.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          readinessProbe:
+            httpGet: { path: /health/ready, port: 8000 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health/live, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }

@@ -1,0 +1,68 @@
+# =============================================================================
+# BONUS: BLUE-GREEN DEPLOYMENT
+# Rolling update  = replace pods gradually, old and new serve users together.
+# Blue-green      = run both versions fully, then switch 100% of traffic at once.
+# Roll back = flip the label back. Seconds, not a rebuild.
+# =============================================================================
+name: Blue-Green Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Full image to release, e.g. user/cicd-demo:a1b2c3d"
+        required: true
+
+jobs:
+  release:
+    name: Deploy to idle colour, smoke test, then switch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      # STEP 1 - which colour is live right now? Ask the Service, not a file.
+      - name: Find the live colour and pick the idle one
+        id: colours
+        run: |
+          LIVE=$(kubectl -n cicd-demo get svc cicd-demo-live \
+                   -o jsonpath='{.spec.selector.color}')
+          if [ "$LIVE" = "blue" ]; then IDLE=green; else IDLE=blue; fi
+          echo "live=$LIVE" >> "$GITHUB_OUTPUT"
+          echo "idle=$IDLE" >> "$GITHUB_OUTPUT"
+          echo "Live is $LIVE, so the new version goes to $IDLE."
+
+      # STEP 2 - deploy the new image to the IDLE colour. Zero users affected.
+      - name: Deploy new image to the idle colour
+        run: |
+          IDLE=${{ steps.colours.outputs.idle }}
+          sed "s|IMAGE_PLACEHOLDER|${{ inputs.image }}|" \
+            k8s/blue-green/deployment-$IDLE.yaml | kubectl apply -f -
+          kubectl -n cicd-demo set image deploy/cicd-demo-$IDLE api=${{ inputs.image }}
+          kubectl -n cicd-demo rollout status deploy/cicd-demo-$IDLE --timeout=120s
+
+      # STEP 3 - smoke test the idle colour through the preview Service.
+      - name: Smoke test the idle colour
+        run: |
+          IDLE=${{ steps.colours.outputs.idle }}
+          kubectl -n cicd-demo run smoke-$GITHUB_RUN_ID --rm -i --restart=Never \
+            --image=curlimages/curl:8.10.1 -- \
+            curl -fsS "http://cicd-demo-preview/api/info"
+
+      # STEP 4 - THE SWITCH. One label, all traffic, instantly.
+      - name: Switch live traffic to the new colour
+        run: |
+          IDLE=${{ steps.colours.outputs.idle }}
+          kubectl -n cicd-demo patch svc cicd-demo-live \
+            -p "{\"spec\":{\"selector\":{\"app\":\"cicd-demo\",\"color\":\"$IDLE\"}}}"
+          echo "Live traffic now served by $IDLE."
+
+      # STEP 5 - the old colour stays running. That is the rollback button.
+      - name: Note the rollback command
+        run: |
+          echo "Rollback: kubectl -n cicd-demo patch svc cicd-demo-live -p '{\"spec\":{\"selector\":{\"app\":\"cicd-demo\",\"color\":\"${{ steps.colours.outputs.live }}\"}}}'"

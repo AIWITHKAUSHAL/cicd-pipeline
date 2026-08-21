@@ -1,0 +1,37 @@
+# BLUE = the currently live version (in the demo).
+# Note the extra label: color: blue. That single label is the whole trick.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cicd-demo-blue
+  namespace: cicd-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cicd-demo
+      color: blue
+  template:
+    metadata:
+      labels:
+        app: cicd-demo
+        color: blue
+    spec:
+      containers:
+        - name: api
+          image: IMAGE_PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 8000 }]
+          env:
+            - name: APP_COLOR
+              value: "blue"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+          readinessProbe:
+            httpGet: { path: /health/ready, port: 8000 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }

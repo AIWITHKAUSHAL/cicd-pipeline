@@ -1,0 +1,11 @@
+# Local cluster for the demo. The extraPortMappings make NodePort 30080/30081
+# reachable at http://localhost:30080 and :30081 on Windows.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+      - containerPort: 30081
+        hostPort: 30081

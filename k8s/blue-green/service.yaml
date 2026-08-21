@@ -1,0 +1,16 @@
+# The LIVE service. Its selector decides which colour receives real users.
+# Flipping this one line IS the blue-green deployment.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cicd-demo-live
+  namespace: cicd-demo
+spec:
+  type: NodePort
+  selector:
+    app: cicd-demo
+    color: blue      # <-- flip to green to release; flip back to roll back
+  ports:
+    - port: 80
+      targetPort: 8000
+      nodePort: 30080

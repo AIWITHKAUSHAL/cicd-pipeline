@@ -1,0 +1,37 @@
+# GREEN = the new version. Deployed alongside blue, taking zero live
+# traffic, until somebody flips the Service selector.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cicd-demo-green
+  namespace: cicd-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cicd-demo
+      color: green
+  template:
+    metadata:
+      labels:
+        app: cicd-demo
+        color: green
+    spec:
+      containers:
+        - name: api
+          image: IMAGE_PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 8000 }]
+          env:
+            - name: APP_COLOR
+              value: "green"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+          readinessProbe:
+            httpGet: { path: /health/ready, port: 8000 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }

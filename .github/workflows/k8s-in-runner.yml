@@ -1,0 +1,116 @@
+# =============================================================================
+# SELF-CONTAINED END-TO-END RUN — no Docker Hub account, no cluster, no secrets.
+#
+# Why this file exists: a GitHub-hosted runner cannot reach a kind cluster on
+# your laptop. So instead of reaching out to a cluster, this workflow CREATES
+# one inside the runner, deploys into it, proves it works, and then does the
+# whole blue-green switch — all in the Actions log.
+#
+# Fork the repo, push, and it goes green. Nothing to configure.
+# The trade-off to say out loud on video: the cluster dies with the job, so
+# this is a *verification* pipeline, not a real deployment. ci-cd.yml is the
+# real one.
+# =============================================================================
+name: E2E (Kubernetes inside the runner)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  e2e:
+    name: Test, build, deploy and switch — all in one runner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------- TESTING ----------------
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run pytest
+        run: pytest -v
+
+      # ---------------- DOCKER BUILD ----------------
+      # Docker is preinstalled on ubuntu-latest, so this needs no setup at all.
+      # No push: the image never leaves the runner.
+      - name: Build the image locally
+        run: docker build --build-arg APP_VERSION=v1-${GITHUB_SHA::7} -t cicd-demo:v1 .
+
+      # ---------------- KUBERNETES ----------------
+      # Creates a real single-node cluster inside the runner in ~30 seconds.
+      - name: Create a kind cluster in the runner
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: cicd-demo
+
+      - name: Show the cluster is real
+        run: |
+          kubectl get nodes -o wide
+          kubectl version --short || kubectl version
+
+      # kind nodes have their own image store, so a locally built image must be
+      # loaded in explicitly. This is the single most common kind gotcha.
+      - name: Load the image into the cluster
+        run: kind load docker-image cicd-demo:v1 --name cicd-demo
+
+      - name: Deploy (rolling update version)
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/service.yaml
+          sed "s|IMAGE_PLACEHOLDER|cicd-demo:v1|" k8s/deployment.yaml | kubectl apply -f -
+          kubectl -n cicd-demo rollout status deploy/cicd-demo --timeout=120s
+          kubectl -n cicd-demo get pods -o wide
+
+      # Proof, not hope: hit the Service from inside the cluster.
+      - name: Verify the app answers through the Service
+        run: |
+          kubectl -n cicd-demo run verify --rm -i --restart=Never \
+            --image=curlimages/curl:8.10.1 -- \
+            curl -fsS http://cicd-demo/api/info
+
+      # ---------------- BONUS: BLUE-GREEN, END TO END ----------------
+      - name: Stand up blue and green side by side
+        run: |
+          sed "s|IMAGE_PLACEHOLDER|cicd-demo:v1|" k8s/blue-green/deployment-blue.yaml  | kubectl apply -f -
+          sed "s|IMAGE_PLACEHOLDER|cicd-demo:v1|" k8s/blue-green/deployment-green.yaml | kubectl apply -f -
+          kubectl apply -f k8s/blue-green/service.yaml
+          kubectl apply -f k8s/blue-green/service-preview.yaml
+          kubectl -n cicd-demo rollout status deploy/cicd-demo-blue  --timeout=120s
+          kubectl -n cicd-demo rollout status deploy/cicd-demo-green --timeout=120s
+          kubectl -n cicd-demo get pods -L color
+
+      - name: Live serves BLUE, preview serves GREEN
+        run: |
+          echo "--- live (real users) ---"
+          kubectl -n cicd-demo run check-live --rm -i --restart=Never \
+            --image=curlimages/curl:8.10.1 -- curl -fsS http://cicd-demo-live/api/info
+          echo "--- preview (only us) ---"
+          kubectl -n cicd-demo run check-preview --rm -i --restart=Never \
+            --image=curlimages/curl:8.10.1 -- curl -fsS http://cicd-demo-preview/api/info
+
+      - name: Switch live traffic to GREEN
+        run: |
+          kubectl -n cicd-demo patch svc cicd-demo-live \
+            -p '{"spec":{"selector":{"app":"cicd-demo","color":"green"}}}'
+          kubectl -n cicd-demo run after-switch --rm -i --restart=Never \
+            --image=curlimages/curl:8.10.1 -- curl -fsS http://cicd-demo-live/api/info
+
+      - name: Roll back to BLUE
+        run: |
+          kubectl -n cicd-demo patch svc cicd-demo-live \
+            -p '{"spec":{"selector":{"app":"cicd-demo","color":"blue"}}}'
+          kubectl -n cicd-demo run after-rollback --rm -i --restart=Never \
+            --image=curlimages/curl:8.10.1 -- curl -fsS http://cicd-demo-live/api/info
+
+      # If anything above failed, this is what you want in the log.
+      - name: Debug on failure
+        if: failure()
+        run: |
+          kubectl -n cicd-demo get all
+          kubectl -n cicd-demo describe pods
+          kubectl -n cicd-demo logs -l app=cicd-demo --tail=100 --all-containers || true
