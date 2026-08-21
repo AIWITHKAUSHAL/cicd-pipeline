@@ -76,6 +76,9 @@ jobs:
       # ---------------- BONUS: BLUE-GREEN, END TO END ----------------
       - name: Stand up blue and green side by side
         run: |
+          # The rolling-update Service above also claims NodePort 30080;
+          # free it so cicd-demo-live can bind to the same port.
+          kubectl -n cicd-demo delete svc cicd-demo --ignore-not-found
           sed "s|IMAGE_PLACEHOLDER|cicd-demo:v1|" k8s/blue-green/deployment-blue.yaml  | kubectl apply -f -
           sed "s|IMAGE_PLACEHOLDER|cicd-demo:v1|" k8s/blue-green/deployment-green.yaml | kubectl apply -f -
           kubectl apply -f k8s/blue-green/service.yaml
