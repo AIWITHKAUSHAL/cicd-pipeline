@@ -14,13 +14,13 @@ A page that fills the screen with **BLUE** or **GREEN**, and prints the version
 and the pod name. That is all. Because of that, the audience can *see* which
 version is live without reading a log.
 
-| Endpoint | Why it exists |
-|---|---|
-| `/` | Big coloured page — proves which version users are hitting |
-| `/api/info` | `{version, color, pod}` — what the smoke test checks |
-| `/api/add` | Something for the tests to actually test |
-| `/health/live` | Liveness probe — failing it **restarts** the pod |
-| `/health/ready` | Readiness probe — failing it only **removes it from the Service** |
+| Endpoint          | Why it exists                                                           |
+| ----------------- | ----------------------------------------------------------------------- |
+| `/`             | Big coloured page — proves which version users are hitting             |
+| `/api/info`     | `{version, color, pod}` — what the smoke test checks                 |
+| `/api/add`      | Something for the tests to actually test                                |
+| `/health/live`  | Liveness probe — failing it**restarts** the pod                  |
+| `/health/ready` | Readiness probe — failing it only**removes it from the Service** |
 
 ---
 
@@ -69,13 +69,13 @@ Blue-green demo:
 
 Repo → Settings → Secrets and variables → Actions:
 
-| Secret | Value |
-|---|---|
-| `DOCKERHUB_USERNAME` | your Docker Hub username |
-| `DOCKERHUB_TOKEN` | Docker Hub **access token**, never your password |
-| `KUBE_CONFIG` | `kubectl config view --raw --minify` output, base64-encoded |
+| Secret                 | Value                                                         |
+| ---------------------- | ------------------------------------------------------------- |
+| `DOCKERHUB_USERNAME` | your Docker Hub username                                      |
+| `DOCKERHUB_TOKEN`    | Docker Hub**access token**, never your password         |
+| `KUBE_CONFIG`        | `kubectl config view --raw --minify` output, base64-encoded |
 
-If `KUBE_CONFIG` is missing, the deploy job skips cleanly instead of failing —
+If `KUBE_CONFIG` is missing, the deploy job skips cleanly instead of failing —  
 so the repo stays green for students who only have a local cluster.
 
 > A kind/minikube cluster on your laptop is **not** reachable from a GitHub-hosted
@@ -85,11 +85,11 @@ so the repo stays green for students who only have a local cluster.
 
 ## "Can the whole thing actually run on GitHub?" — yes, three ways
 
-| Workflow | Runs on GitHub? | Needs | Deploys to |
-|---|---|---|---|
-| `k8s-in-runner.yml` | **fully, out of the box** | nothing | a kind cluster created inside the runner |
-| `ci-cd.yml` jobs 1–2 | yes | Docker Hub secrets | nothing (build + push only) |
-| `ci-cd.yml` job 3 | yes | `KUBE_CONFIG` for a **reachable** cluster | EKS/GKE/AKS, or a self-hosted runner |
+| Workflow                | Runs on GitHub?                 | Needs                                             | Deploys to                               |
+| ----------------------- | ------------------------------- | ------------------------------------------------- | ---------------------------------------- |
+| `k8s-in-runner.yml`   | **fully, out of the box** | nothing                                           | a kind cluster created inside the runner |
+| `ci-cd.yml` jobs 1–2 | yes                             | Docker Hub secrets                                | nothing (build + push only)              |
+| `ci-cd.yml` job 3     | yes                             | `KUBE_CONFIG` for a **reachable** cluster | EKS/GKE/AKS, or a self-hosted runner     |
 
 **`k8s-in-runner.yml` is the one to demo first.** It runs pytest, builds the
 image with Docker (preinstalled on `ubuntu-latest`), creates a real Kubernetes
