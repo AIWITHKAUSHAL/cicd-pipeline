@@ -110,6 +110,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Self-sufficient: if the runner's machine has no kind cluster yet
+      # (fresh machine, or someone ran `kind delete cluster`), create one
+      # instead of failing. Safe to run every time - no-ops if it exists.
+      - name: Ensure the local kind cluster exists
+        run: |
+          if kind get clusters | grep -qx "cicd-demo"; then
+            echo "kind cluster 'cicd-demo' already exists - reusing it."
+          else
+            echo "No 'cicd-demo' kind cluster found - creating one."
+            kind create cluster --name cicd-demo --config k8s/kind-cluster.yaml
+          fi
+
       - name: Point kubectl at the local kind cluster
         run: kubectl config use-context kind-cicd-demo
 
@@ -130,6 +142,17 @@ jobs:
           kubectl -n cicd-demo set image deploy/cicd-demo \
             api=${{ needs.build-and-push.outputs.image }}
           kubectl -n cicd-demo rollout status deploy/cicd-demo --timeout=120s
+
+      # rollout status only proves the pods are Ready - this proves the
+      # Service actually answers, and prints which colour/version is live.
+      - name: Verify the app is online
+        run: |
+          RESPONSE=$(curl -fsS --retry 5 --retry-delay 3 --retry-connrefused \
+            http://localhost:30080/api/info)
+          echo "Live at http://localhost:30080 -> ${RESPONSE}"
+          echo "${RESPONSE}" | grep -q '"color":"blue"' \
+            && echo "Status: ONLINE (blue)" \
+            || { echo "Status: unexpected response - not confirmed blue"; exit 1; }
 
       # If readiness never goes green, undo automatically. Show this failing
       # on video by pushing a deliberately broken commit.
