@@ -16,7 +16,7 @@ client = TestClient(app)
 
 def test_info_returns_version_color_and_pod():
     body = client.get("/api/info").json()
-    assert set(body) == {"version", "color", "pod"}
+    assert set(body) == {"version", "color", "pod", "greeting"}
 
 
 def test_add_happy_path():
