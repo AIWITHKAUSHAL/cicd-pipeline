@@ -65,6 +65,11 @@ jobs:
           echo "image=${IMAGE}:${SHA_SHORT}"   >> "$GITHUB_OUTPUT"
           echo "Will build ${IMAGE}:${SHA_SHORT}"
 
+      # QEMU lets the amd64 GitHub runner cross-build an arm64 layer too, so
+      # the image also runs on Apple Silicon (the self-hosted deploy target).
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       # Buildx gives us layer caching that survives between workflow runs.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -80,6 +85,7 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           build-args: |
             APP_VERSION=${{ steps.meta.outputs.sha_short }}
           # TWO tags on purpose:
@@ -93,37 +99,21 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # JOB 3 - KUBERNETES DEPLOYMENT (rolling update).
-  # The cluster is reached with a kubeconfig stored as a GitHub secret.
+  # Runs on a self-hosted runner (your Mac) so it can reach the local `kind`
+  # cluster directly - no cloud cluster, no KUBE_CONFIG secret needed.
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy to Kubernetes
     needs: build-and-push
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    environment: production      # lets you require a manual approval here
+    runs-on: [self-hosted, macOS, kind]
     steps:
       - uses: actions/checkout@v4
 
-      # Secrets cannot be used in a job-level `if:`, so the guard lives here.
-      - name: Check cluster credentials are configured
-        id: guard
-        run: |
-          if [ -z "${{ secrets.KUBE_CONFIG }}" ]; then
-            echo "No KUBE_CONFIG secret - skipping deploy (fine for a demo repo)."
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Write kubeconfig
-        if: steps.guard.outputs.ready == 'true'
-        run: |
-          mkdir -p "$HOME/.kube"
-          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
+      - name: Point kubectl at the local kind cluster
+        run: kubectl config use-context kind-cicd-demo
 
       - name: Apply manifests
-        if: steps.guard.outputs.ready == 'true'
         run: |
           kubectl apply -f k8s/namespace.yaml
           kubectl apply -f k8s/service.yaml
@@ -136,7 +126,6 @@ jobs:
       # This one line is "continuous deployment". Everything above exists
       # so that this line is safe to run automatically.
       - name: Roll out the new image
-        if: steps.guard.outputs.ready == 'true'
         run: |
           kubectl -n cicd-demo set image deploy/cicd-demo \
             api=${{ needs.build-and-push.outputs.image }}
@@ -145,5 +134,5 @@ jobs:
       # If readiness never goes green, undo automatically. Show this failing
       # on video by pushing a deliberately broken commit.
       - name: Roll back if the rollout failed
-        if: failure() && steps.guard.outputs.ready == 'true'
+        if: failure()
         run: kubectl -n cicd-demo rollout undo deploy/cicd-demo
