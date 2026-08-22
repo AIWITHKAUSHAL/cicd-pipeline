@@ -35,7 +35,7 @@ PALETTE = {
 @app.get("/api/info")
 def info() -> dict:
     """Everything the video needs to prove, in one JSON object."""
-    return {"version": APP_VERSION, "color": APP_COLOR, "pod": POD_NAME, "greeting": "full cycle test"}
+    return {"version": APP_VERSION, "color": APP_COLOR, "pod": POD_NAME, "greeting": "render auto-deploy verified"}
 
 
 @app.get("/api/add")
