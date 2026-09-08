@@ -26,6 +26,20 @@ POD_NAME = os.getenv("POD_NAME", "local")
 
 app = FastAPI(title="CI/CD Demo", version=APP_VERSION)
 
+
+# Blue-green switches traffic by editing a Service selector, so the URL never
+# changes - only the pod behind it does. A browser has no way to know that and
+# will happily re-serve the previous colour from its cache, which makes a
+# successful switch look like it failed. Tell it never to store a response.
+@app.middleware("http")
+async def no_store(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 PALETTE = {
     "blue": ("#0b2545", "#4cc9f0"),
     "green": ("#0b2e1f", "#57d68d"),

@@ -38,3 +38,9 @@ def test_liveness_and_readiness_are_separate_endpoints():
 
 def test_home_page_renders():
     assert "version" in client.get("/").text
+
+
+def test_responses_are_never_cached():
+    """A cached response would show the old colour after a blue-green switch."""
+    for path in ("/", "/api/info"):
+        assert "no-store" in client.get(path).headers["cache-control"]
