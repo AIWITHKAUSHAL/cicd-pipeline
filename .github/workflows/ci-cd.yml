@@ -188,14 +188,22 @@ jobs:
       - name: Smoke-test the new version before any user sees it
         run: |
           EXPECTED="${IMAGE##*:}"
-          RESPONSE=$(curl -fsS --retry 10 --retry-delay 3 --retry-connrefused --retry-all-errors \
-            http://localhost:30081/api/info)
-          echo "preview -> ${RESPONSE}"
-          echo "${RESPONSE}" | grep -q "\"version\":\"${EXPECTED}\"" \
-            || { echo "Preview is not serving ${EXPECTED} - refusing to promote."; exit 1; }
-          echo "${RESPONSE}" | grep -q "\"color\":\"${IDLE_COLOR}\"" \
-            || { echo "Preview is not serving ${IDLE_COLOR} - refusing to promote."; exit 1; }
-          echo "Smoke test passed - safe to promote."
+          # Poll for the value we expect. A plain curl can come back 200 with the
+          # PREVIOUS colour still in the body while kube-proxy catches up, and no
+          # --retry flag helps: a stale 200 is a success as far as curl knows.
+          for i in $(seq 1 30); do
+            RESPONSE=$(curl -fsS -m 5 http://localhost:30081/api/info 2>/dev/null || true)
+            if echo "${RESPONSE}" | grep -q "\"version\":\"${EXPECTED}\"" \
+               && echo "${RESPONSE}" | grep -q "\"color\":\"${IDLE_COLOR}\""; then
+              echo "preview -> ${RESPONSE}"
+              echo "Smoke test passed - safe to promote."
+              exit 0
+            fi
+            echo "waiting for preview to serve ${EXPECTED}/${IDLE_COLOR}... got: ${RESPONSE:-no response}"
+            sleep 2
+          done
+          echo "Preview never served ${EXPECTED}/${IDLE_COLOR} - refusing to promote."
+          exit 1
 
       # THE RELEASE. One selector edit moves every user at once. No pod starts and
       # no image is pulled: the new version has been running and warm all along.
@@ -211,12 +219,21 @@ jobs:
       - name: Verify what real users are getting
         run: |
           EXPECTED="${IMAGE##*:}"
-          RESPONSE=$(curl -fsS --retry 10 --retry-delay 3 --retry-connrefused --retry-all-errors \
-            http://localhost:30080/api/info)
-          echo "Live at http://localhost:30080 -> ${RESPONSE}"
-          echo "${RESPONSE}" | grep -q "\"version\":\"${EXPECTED}\"" \
-            || { echo "Live is not serving ${EXPECTED}"; exit 1; }
-          echo "Status: ONLINE (${IDLE_COLOR}, ${EXPECTED})"
+          # The selector patch is instant; kube-proxy reprogramming the node is
+          # not. For a moment :30080 still answers 200 from the OLD colour, so
+          # poll for the new version instead of trusting a single request.
+          for i in $(seq 1 30); do
+            RESPONSE=$(curl -fsS -m 5 http://localhost:30080/api/info 2>/dev/null || true)
+            if echo "${RESPONSE}" | grep -q "\"version\":\"${EXPECTED}\""; then
+              echo "Live at http://localhost:30080 -> ${RESPONSE}"
+              echo "Status: ONLINE (${IDLE_COLOR}, ${EXPECTED})"
+              exit 0
+            fi
+            echo "waiting for live traffic to reach ${EXPECTED}... got: ${RESPONSE:-no response}"
+            sleep 2
+          done
+          echo "Live never served ${EXPECTED} - last response: ${RESPONSE}"
+          exit 1
 
       # Instant rollback: the old colour never stopped running, so undoing the
       # release is one more selector edit - not a redeploy.
