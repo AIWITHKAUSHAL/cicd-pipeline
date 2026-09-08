@@ -10,7 +10,15 @@ on:
     branches: [main]        # merge to main = release
   pull_request:
     branches: [main]        # PRs get tested, but never deployed
-  workflow_dispatch: {}     # manual "Run workflow" button, useful on video
+  workflow_dispatch:        # manual "Run workflow" button, useful on video
+    inputs:
+      strategy:
+        description: "How job 3 should release the new version"
+        type: choice
+        default: blue-green
+        options:
+          - blue-green
+          - rolling
 
 # Values shared by every job. Change the image name in ONE place.
 env:
@@ -98,21 +106,23 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ---------------------------------------------------------------------------
-  # JOB 3 - KUBERNETES DEPLOYMENT (rolling update).
+  # JOB 3 - KUBERNETES DEPLOYMENT, BLUE-GREEN (the default).
+  # Deploys the new image to whichever colour is NOT live, proves it works on
+  # the preview port, and only then moves real users. Deploying and releasing
+  # are two separate events - that separation IS blue-green.
   # Runs on a self-hosted runner (your Mac) so it can reach the local `kind`
   # cluster directly - no cloud cluster, no KUBE_CONFIG secret needed.
   # ---------------------------------------------------------------------------
-  deploy:
-    name: Deploy to Kubernetes
+  deploy-bluegreen:
+    name: Deploy to Kubernetes (blue-green)
     needs: build-and-push
-    if: github.event_name != 'pull_request'
+    if: ${{ github.event_name != 'pull_request' && (inputs.strategy || 'blue-green') == 'blue-green' }}
     runs-on: [self-hosted, macOS, kind]
+    env:
+      IMAGE: ${{ needs.build-and-push.outputs.image }}
     steps:
       - uses: actions/checkout@v4
 
-      # Self-sufficient: if the runner's machine has no kind cluster yet
-      # (fresh machine, or someone ran `kind delete cluster`), create one
-      # instead of failing. Safe to run every time - no-ops if it exists.
       - name: Ensure the local kind cluster exists
         run: |
           if kind get clusters | grep -qx "cicd-demo"; then
@@ -124,6 +134,125 @@ jobs:
 
       - name: Point kubectl at the local kind cluster
         run: kubectl config use-context kind-cicd-demo
+
+      # Only one Service can own nodePort 30080. If the rolling-update demo is
+      # currently holding it, take it back, or cicd-demo-live cannot be created.
+      - name: Release nodePort 30080 from the rolling-update deploy
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl -n cicd-demo delete svc    cicd-demo --ignore-not-found
+          kubectl -n cicd-demo delete deploy cicd-demo --ignore-not-found
+
+      # The idle colour is the one nobody is being served by, so it is the only
+      # one we are allowed to overwrite. First ever run has no live Service.
+      - name: Work out which colour is live
+        run: |
+          LIVE=$(kubectl -n cicd-demo get svc cicd-demo-live \
+                   -o jsonpath='{.spec.selector.color}' 2>/dev/null || true)
+          if [ "$LIVE" = "blue" ]; then IDLE=green; else IDLE=blue; fi
+          echo "LIVE_COLOR=$LIVE" >> "$GITHUB_ENV"
+          echo "IDLE_COLOR=$IDLE" >> "$GITHUB_ENV"
+          echo "live=${LIVE:-none yet}  ->  deploying into $IDLE"
+
+      - name: Deploy the new image into the idle colour
+        run: |
+          if kubectl -n cicd-demo get deploy "cicd-demo-${IDLE_COLOR}" >/dev/null 2>&1; then
+            kubectl -n cicd-demo set image "deploy/cicd-demo-${IDLE_COLOR}" "api=${IMAGE}"
+          else
+            sed "s|IMAGE_PLACEHOLDER|${IMAGE}|" \
+              "k8s/blue-green/deployment-${IDLE_COLOR}.yaml" | kubectl apply -f -
+          fi
+          kubectl -n cicd-demo rollout status "deploy/cicd-demo-${IDLE_COLOR}" --timeout=180s
+
+      # Preview always points at the colour we just deployed, so the new version
+      # is reachable on :30081 while real users stay on the old one.
+      - name: Expose the new version on the preview port
+        run: |
+          kubectl apply -f k8s/blue-green/service-preview.yaml
+          kubectl -n cicd-demo patch svc cicd-demo-preview \
+            -p "{\"spec\":{\"selector\":{\"app\":\"cicd-demo\",\"color\":\"${IDLE_COLOR}\"}}}"
+
+      # THE GATE. Fail here and the job stops with live traffic untouched - there
+      # is nothing to roll back, because no release ever happened.
+      - name: Smoke-test the new version before any user sees it
+        run: |
+          EXPECTED="${IMAGE##*:}"
+          RESPONSE=$(curl -fsS --retry 5 --retry-delay 3 --retry-connrefused \
+            http://localhost:30081/api/info)
+          echo "preview -> ${RESPONSE}"
+          echo "${RESPONSE}" | grep -q "\"version\":\"${EXPECTED}\"" \
+            || { echo "Preview is not serving ${EXPECTED} - refusing to promote."; exit 1; }
+          echo "${RESPONSE}" | grep -q "\"color\":\"${IDLE_COLOR}\"" \
+            || { echo "Preview is not serving ${IDLE_COLOR} - refusing to promote."; exit 1; }
+          echo "Smoke test passed - safe to promote."
+
+      # THE RELEASE. One selector edit moves every user at once. No pod starts and
+      # no image is pulled: the new version has been running and warm all along.
+      - name: Promote - move live traffic to the new colour
+        run: |
+          if ! kubectl -n cicd-demo get svc cicd-demo-live >/dev/null 2>&1; then
+            kubectl apply -f k8s/blue-green/service.yaml
+          fi
+          kubectl -n cicd-demo patch svc cicd-demo-live \
+            -p "{\"spec\":{\"selector\":{\"app\":\"cicd-demo\",\"color\":\"${IDLE_COLOR}\"}}}"
+          echo "live traffic: ${LIVE_COLOR:-none} -> ${IDLE_COLOR}"
+
+      - name: Verify what real users are getting
+        run: |
+          EXPECTED="${IMAGE##*:}"
+          RESPONSE=$(curl -fsS --retry 5 --retry-delay 3 --retry-connrefused \
+            http://localhost:30080/api/info)
+          echo "Live at http://localhost:30080 -> ${RESPONSE}"
+          echo "${RESPONSE}" | grep -q "\"version\":\"${EXPECTED}\"" \
+            || { echo "Live is not serving ${EXPECTED}"; exit 1; }
+          echo "Status: ONLINE (${IDLE_COLOR}, ${EXPECTED})"
+
+      # Instant rollback: the old colour never stopped running, so undoing the
+      # release is one more selector edit - not a redeploy.
+      - name: Roll back if the promotion failed
+        if: failure()
+        run: |
+          if [ -n "${LIVE_COLOR}" ]; then
+            echo "Promotion failed - putting live traffic back on ${LIVE_COLOR}."
+            kubectl -n cicd-demo patch svc cicd-demo-live \
+              -p "{\"spec\":{\"selector\":{\"app\":\"cicd-demo\",\"color\":\"${LIVE_COLOR}\"}}}"
+          else
+            echo "First deploy - no previous colour to roll back to."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # JOB 3 (alternative) - KUBERNETES DEPLOYMENT, ROLLING UPDATE.
+  # The original strategy, kept so both can be demonstrated. Only runs when you
+  # pick "rolling" from the Run workflow menu, because it and blue-green both
+  # want nodePort 30080 and cannot be live at the same time.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to Kubernetes (rolling update)
+    needs: build-and-push
+    if: ${{ github.event_name != 'pull_request' && inputs.strategy == 'rolling' }}
+    runs-on: [self-hosted, macOS, kind]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure the local kind cluster exists
+        run: |
+          if kind get clusters | grep -qx "cicd-demo"; then
+            echo "kind cluster 'cicd-demo' already exists - reusing it."
+          else
+            echo "No 'cicd-demo' kind cluster found - creating one."
+            kind create cluster --name cicd-demo --config k8s/kind-cluster.yaml
+          fi
+
+      - name: Point kubectl at the local kind cluster
+        run: kubectl config use-context kind-cicd-demo
+
+      # Mirror image of the blue-green job: take nodePort 30080 back from the
+      # blue-green Services so the plain cicd-demo Service can bind it.
+      - name: Release nodePort 30080 from the blue-green deploy
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl -n cicd-demo delete svc    cicd-demo-live cicd-demo-preview --ignore-not-found
+          kubectl -n cicd-demo delete deploy cicd-demo-blue cicd-demo-green   --ignore-not-found
 
       - name: Apply manifests
         run: |
