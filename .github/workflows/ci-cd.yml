@@ -172,12 +172,23 @@ jobs:
           kubectl -n cicd-demo patch svc cicd-demo-preview \
             -p "{\"spec\":{\"selector\":{\"app\":\"cicd-demo\",\"color\":\"${IDLE_COLOR}\"}}}"
 
+          # Ready pods are NOT the same thing as a routable Service. kube-proxy
+          # needs a moment to program the new endpoints; until it has, the kind
+          # node accepts the TCP connection and then resets it. Wait it out.
+          for i in $(seq 1 30); do
+            EPS=$(kubectl -n cicd-demo get endpoints cicd-demo-preview \
+                    -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+            if [ -n "$EPS" ]; then echo "preview endpoints ready: ${EPS}"; break; fi
+            echo "waiting for preview endpoints..."
+            sleep 2
+          done
+
       # THE GATE. Fail here and the job stops with live traffic untouched - there
       # is nothing to roll back, because no release ever happened.
       - name: Smoke-test the new version before any user sees it
         run: |
           EXPECTED="${IMAGE##*:}"
-          RESPONSE=$(curl -fsS --retry 5 --retry-delay 3 --retry-connrefused \
+          RESPONSE=$(curl -fsS --retry 10 --retry-delay 3 --retry-connrefused --retry-all-errors \
             http://localhost:30081/api/info)
           echo "preview -> ${RESPONSE}"
           echo "${RESPONSE}" | grep -q "\"version\":\"${EXPECTED}\"" \
@@ -200,7 +211,7 @@ jobs:
       - name: Verify what real users are getting
         run: |
           EXPECTED="${IMAGE##*:}"
-          RESPONSE=$(curl -fsS --retry 5 --retry-delay 3 --retry-connrefused \
+          RESPONSE=$(curl -fsS --retry 10 --retry-delay 3 --retry-connrefused --retry-all-errors \
             http://localhost:30080/api/info)
           echo "Live at http://localhost:30080 -> ${RESPONSE}"
           echo "${RESPONSE}" | grep -q "\"version\":\"${EXPECTED}\"" \
@@ -276,7 +287,7 @@ jobs:
       # Service actually answers, and prints which colour/version is live.
       - name: Verify the app is online
         run: |
-          RESPONSE=$(curl -fsS --retry 5 --retry-delay 3 --retry-connrefused \
+          RESPONSE=$(curl -fsS --retry 10 --retry-delay 3 --retry-connrefused --retry-all-errors \
             http://localhost:30080/api/info)
           echo "Live at http://localhost:30080 -> ${RESPONSE}"
           echo "${RESPONSE}" | grep -q '"color":"blue"' \
