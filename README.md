@@ -1,10 +1,29 @@
 # Complete CI/CD Pipeline — teaching edition
 
-`GitHub → Testing → Docker Build → Docker Hub → Kubernetes Deployment`
-plus the bonus: **Blue-Green Deployment**.
+`GitHub push → pytest → Docker build → Docker Hub push → Kubernetes deployment`
+plus automated smoke testing, promotion, and rollback using **blue-green
+deployment**.
 
-The app is intentionally tiny (one file, ~60 lines). Everything worth
+The app is intentionally tiny (one Python module). Everything worth
 explaining lives in the pipeline, not in the code.
+
+## Assignment requirements and implementation evidence
+
+All assessed parts are included in this repository:
+
+| Requirement | Implementation |
+| --- | --- |
+| Automated testing | [`ci-cd.yml`](.github/workflows/ci-cd.yml) runs all 7 tests in [`tests/test_main.py`](tests/test_main.py) before any image is built. |
+| Image build and push | The `build-and-push` job logs in with `docker/login-action@v3` and uses `docker/build-push-action@v6` to push both an immutable commit-SHA tag and `latest` to Docker Hub. |
+| Kubernetes deployment | The workflow applies the manifests under [`k8s/`](k8s/) and waits for the Kubernetes rollout to become healthy. |
+| Blue-green deployment | [`deployment-blue.yaml`](k8s/blue-green/deployment-blue.yaml) and [`deployment-green.yaml`](k8s/blue-green/deployment-green.yaml) run side by side. The [live Service](k8s/blue-green/service.yaml) and [preview Service](k8s/blue-green/service-preview.yaml) route traffic using the `color` selector. |
+| GitHub Actions automation | A push to `main` automatically performs test → build → push → deploy using [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml). Pull requests run tests but do not publish or deploy. |
+
+> **Important when submitting:** `.github` is a hidden directory on macOS and
+> Linux. If files are selected manually for upload, the complete Actions
+> workflow can be omitted even though it exists locally. See
+> [Submission checklist](#submission-checklist) for a safe way to create the
+> submission archive.
 
 ---
 
@@ -17,10 +36,30 @@ version is live without reading a log.
 | Endpoint          | Why it exists                                                           |
 | ----------------- | ----------------------------------------------------------------------- |
 | `/`             | Big coloured page — proves which version users are hitting             |
-| `/api/info`     | `{version, color, pod}` — what the smoke test checks                 |
+| `/api/info`     | `{version, color, pod, greeting}` — what the smoke test checks       |
 | `/api/add`      | Something for the tests to actually test                                |
-| `/health/live`  | Liveness probe — failing it**restarts** the pod                  |
-| `/health/ready` | Readiness probe — failing it only**removes it from the Service** |
+| `/health/live`  | Liveness endpoint — a failed configured probe restarts the pod       |
+| `/health/ready` | Readiness endpoint — a failed probe removes the pod from the Service  |
+
+Runtime request flow:
+
+```text
+Browser / smoke test
+        |
+        v
+localhost:30080 (live) or :30081 (preview)
+        |
+        v
+Kubernetes NodePort Service
+        |
+        | selector: app=cicd-demo,color=blue|green
+        v
+Ready FastAPI pod on port 8000
+        |
+        +-- APP_VERSION: embedded in the image during docker build
+        +-- APP_COLOR:   supplied by the Kubernetes Deployment
+        +-- POD_NAME:    supplied by the Kubernetes Downward API
+```
 
 ---
 
@@ -28,26 +67,37 @@ version is live without reading a log.
 
 ```
 app/main.py                     the whole application
-tests/test_main.py              6 tests — the "Automated Testing" requirement
+tests/test_main.py              7 tests — the "Automated Testing" requirement
 Dockerfile                      one instruction per concept, commented
-.github/workflows/ci-cd.yml     test → build → push → deploy (rolling update)
+.github/workflows/ci-cd.yml     test → build → push → deploy (blue-green default)
 .github/workflows/blue-green.yml  the bonus: deploy idle -> smoke test -> switch
 .github/workflows/k8s-in-runner.yml  full E2E inside GitHub, zero secrets needed
 k8s/deployment.yaml             rolling-update Deployment (maxUnavailable: 0)
 k8s/service.yaml                NodePort 30080
 k8s/blue-green/                 blue + green Deployments, live + preview Services
-scripts/*.ps1                   local demo on Windows + kind
+scripts/*.ps1                   local demo on Windows/PowerShell + kind
+scripts/*.sh                    blue-green demo helpers for macOS/Linux
 docs/PIPELINE_EXPLAINED.md      concept-by-concept teaching notes
 docs/VIDEO_SCRIPT.md            beat-by-beat recording script
 ```
 
 ---
 
-## Run it locally in 4 commands
+## Prerequisites
+
+- Python 3.11 and `pip`
+- Docker Desktop or another running Docker engine
+- `kind`
+- `kubectl`
+- PowerShell for the complete local helper-script flow
+- A Docker Hub account and GitHub repository secrets only for the registry
+  pipeline; the self-contained E2E workflow needs neither
+
+## Run it locally
 
 ```powershell
 pip install -r requirements.txt
-pytest -v                       # 6 passing tests
+pytest -v                       # 7 passing tests
 .\scripts\kind-up.ps1           # local Kubernetes cluster
 .\scripts\deploy-local.ps1 -Version v1
 # open http://localhost:30080
@@ -56,12 +106,73 @@ pytest -v                       # 6 passing tests
 Blue-green demo:
 
 ```powershell
+# Free NodePort 30080 if the rolling-update demo above is still running.
+kubectl -n cicd-demo delete svc cicd-demo --ignore-not-found
 .\scripts\bluegreen-up.ps1 -BlueVersion v1 -GreenVersion v2
 # live    -> http://localhost:30080   (blue)
 # preview -> http://localhost:30081   (green, no real users)
 .\scripts\switch-color.ps1            # flip live traffic to green
 .\scripts\switch-color.ps1 -To blue   # rollback in under a second
 ```
+
+On macOS/Linux, after creating the `cicd-demo` kind cluster and namespace, the
+equivalent blue-green commands are:
+
+```bash
+kubectl -n cicd-demo delete svc cicd-demo --ignore-not-found
+./scripts/bluegreen-up.sh v1 v2
+./scripts/watch-live.sh                 # optional traffic monitor
+./scripts/switch-color.sh               # promote the idle colour
+./scripts/switch-color.sh blue          # roll back to blue
+```
+
+To remove the local cluster on Windows, run `.\scripts\teardown.ps1`. On
+macOS/Linux, run `kind delete cluster --name cicd-demo`.
+
+---
+
+## Automatic GitHub Actions flow
+
+The main workflow is [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml).
+It runs automatically for pushes to `main`, runs its test job for pull requests
+to `main`, and can also be started with the **Run workflow** button.
+
+```text
+push to main
+    |
+    v
+1. test (GitHub-hosted Ubuntu runner)
+   checkout -> Python 3.11 -> install dependencies -> pytest
+    |
+    | only if tests pass
+    v
+2. build-and-push (GitHub-hosted Ubuntu runner)
+   derive 7-character SHA tag
+   -> log in to Docker Hub
+   -> build linux/amd64 + linux/arm64 image
+   -> push docker.io/<user>/cicd-demo:<sha> and :latest
+    |
+    | immutable image reference passed as a job output
+    v
+3. deploy-bluegreen (self-hosted runner with access to kind)
+   find live colour -> deploy image to idle colour
+   -> wait for Ready pods -> point preview Service at idle colour
+   -> smoke-test version and colour on port 30081
+   -> switch live Service selector
+   -> verify port 30080
+   -> switch back to the previous colour if verification fails
+```
+
+Blue-green is the default strategy for both automatic pushes and manual runs.
+For a rolling update, select `rolling` in the manual workflow input. The
+rolling job applies [`k8s/deployment.yaml`](k8s/deployment.yaml), updates the
+container image, waits for rollout completion, tests the live Service, and runs
+`kubectl rollout undo` on failure.
+
+The separate [`.github/workflows/blue-green.yml`](.github/workflows/blue-green.yml)
+is a manual release workflow for an image that has already been built. Its
+optional `image` input accepts a complete image reference; when left blank, it
+releases `docker.io/<DOCKERHUB_USERNAME>/cicd-demo:latest`.
 
 ---
 
@@ -92,13 +203,14 @@ runs on a self-hosted runner instead of an internet-reachable cluster. See
 
 ---
 
-## "Can the whole thing actually run on GitHub?" — yes, three ways
+## Where the workflows run
 
 | Workflow                | Runs on GitHub?                 | Needs                                             | Deploys to                               |
 | ----------------------- | ------------------------------- | ------------------------------------------------- | ---------------------------------------- |
 | `k8s-in-runner.yml`   | **fully, out of the box** | nothing                                           | a kind cluster created inside the runner |
 | `ci-cd.yml` jobs 1–2 | yes                             | Docker Hub variable + secret                      | nothing (build + push only)              |
-| `ci-cd.yml` job 3     | on a **self-hosted runner**, not GitHub's cloud | a runner registered on a machine that can reach the cluster | this repo: your local kind cluster |
+| `ci-cd.yml` job 3     | on a **self-hosted runner**, not GitHub's cloud | a runner registered on a machine that can reach the cluster | this repo's local kind cluster |
+| `blue-green.yml`      | on the same **self-hosted runner** | an already-pushed image and the Docker Hub username variable | this repo's local kind cluster |
 
 **`k8s-in-runner.yml` is the one to demo first.** It runs pytest, builds the
 image with Docker (preinstalled on `ubuntu-latest`), creates a real Kubernetes
@@ -121,10 +233,12 @@ cluster, or a self-hosted runner on the machine that has your kind cluster.
 - **`if: github.event_name != 'pull_request'`** — PRs get tested, never published.
 - **Tag = git SHA** — `:latest` is a moving target; a SHA tag is immutable, so a
   rollback means redeploying a tag that definitely still exists.
-- **`maxUnavailable: 0`** — the rolling update never dips below full capacity.
+- **`maxUnavailable: 0`** — the optional rolling update never deliberately
+  removes an old pod before a replacement is available.
 - **`kubectl rollout status`** — turns "kubectl accepted my YAML" into "the new
   pods are actually healthy". Without it the job goes green on a broken deploy.
-- **`rollout undo` on failure** — automatic rollback, `if: failure()`.
+- **Rollback on failure** — rolling deployment uses `kubectl rollout undo`;
+  blue-green deployment switches the live Service back to the previous colour.
 
 Full explanations: `docs/PIPELINE_EXPLAINED.md`.
 
@@ -180,8 +294,8 @@ the kubeconfig that's already sitting there.
    ./svc.sh start
    ```
 
-4. `ci-cd.yml`'s `deploy` job already targets this runner
-   (`runs-on: [self-hosted, macOS, kind]`) and runs
+4. Both deployment jobs in `ci-cd.yml` already target this runner
+   (`runs-on: [self-hosted, macOS, kind]`) and run
    `kubectl config use-context kind-cicd-demo` before applying anything, so no
    further workflow changes are needed — just make sure `kind get clusters`
    shows `cicd-demo` and the runner is online before you push.
@@ -209,11 +323,12 @@ kubectl config current-context          # -> kind-cicd-demo
 # 2. What's actually running right now
 kubectl -n cicd-demo get deploy,pods,svc
 
-# 3. The running image tag matches the exact commit that triggered the pipeline
-kubectl -n cicd-demo get deploy cicd-demo \
+# 3. For the default blue-green flow, find the live colour and running image
+LIVE_COLOR=$(kubectl -n cicd-demo get svc cicd-demo-live \
+  -o jsonpath='{.spec.selector.color}')
+kubectl -n cicd-demo get deploy "cicd-demo-${LIVE_COLOR}" \
   -o jsonpath='{.spec.template.spec.containers[0].image}'
 echo
-git log -1 --format=%h
 
 # 4. The live app reports the same version
 curl -s http://localhost:30080/api/info
@@ -222,11 +337,69 @@ curl -s http://localhost:30080/api/info
 gh api repos/OWNER/REPO/actions/runners --jq '.runners[] | {name,status}'
 ```
 
-One-liner that proves it end to end — commit SHA, the running image, and the
-live app's own reported version, all cross-checked at once:
+End-to-end check for the default blue-green flow. This compares the local
+commit, the live Deployment's image tag, and the version reported by the app:
 
 ```bash
-diff <(git log -1 --format=%h) \
-     <(curl -s http://localhost:30080/api/info | python3 -c "import json,sys;print(json.load(sys.stdin)['version'])") \
-  && echo "MATCH — this pod was deployed by this pipeline run"
+GIT_VERSION=$(git rev-parse --short=7 HEAD)
+LIVE_COLOR=$(kubectl -n cicd-demo get svc cicd-demo-live \
+  -o jsonpath='{.spec.selector.color}')
+IMAGE=$(kubectl -n cicd-demo get deploy "cicd-demo-${LIVE_COLOR}" \
+  -o jsonpath='{.spec.template.spec.containers[0].image}')
+IMAGE_VERSION=${IMAGE##*:}
+APP_VERSION=$(curl -fsS http://localhost:30080/api/info | \
+  python3 -c "import json,sys; print(json.load(sys.stdin)['version'])")
+
+printf 'git=%s image=%s app=%s\n' "$GIT_VERSION" "$IMAGE_VERSION" "$APP_VERSION"
+test "$GIT_VERSION" = "$IMAGE_VERSION" && \
+  test "$IMAGE_VERSION" = "$APP_VERSION" && \
+  echo "MATCH — the live pod was built from this commit"
 ```
+
+For a manually selected rolling deployment, inspect `deploy/cicd-demo`
+instead of `deploy/cicd-demo-${LIVE_COLOR}`.
+
+---
+
+## Submission checklist
+
+The grader feedback saying that the workflow and manifests were absent normally
+means those directories were not included in the submitted archive. They are
+present and tracked in this repository. Confirm that Git sees them:
+
+```bash
+git ls-files .github/workflows k8s
+```
+
+After committing the final changes, create the submission archive from tracked
+files instead of selecting files in Finder. This preserves the hidden `.github`
+directory:
+
+```bash
+git archive --format=zip --output=cicd-pipeline-submission.zip HEAD
+unzip -l cicd-pipeline-submission.zip | \
+  grep -E '(\.github/workflows/ci-cd\.yml|k8s/blue-green/deployment-(blue|green)\.yaml|k8s/blue-green/service\.yaml)'
+```
+
+Before submitting, open the archive and confirm it contains at least:
+
+```text
+.github/workflows/ci-cd.yml
+.github/workflows/blue-green.yml
+.github/workflows/k8s-in-runner.yml
+k8s/deployment.yaml
+k8s/service.yaml
+k8s/blue-green/deployment-blue.yaml
+k8s/blue-green/deployment-green.yaml
+k8s/blue-green/service.yaml
+k8s/blue-green/service-preview.yaml
+Dockerfile
+requirements.txt
+app/main.py
+tests/test_main.py
+```
+
+If submission is by GitHub URL, also confirm the repository's **Actions** tab
+shows the CI/CD workflow and that the files above are visible on the selected
+branch. A README description is supporting evidence; the grader must receive
+the actual `.github` and `k8s` files for the pipeline to be reproducible.
