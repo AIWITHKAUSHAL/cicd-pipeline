@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       image:
-        description: "Image to release. Blank = <user>/cicd-demo:latest"
+        description: "Optional. Full image ref e.g. user/cicd-demo:a1b2c3d - leave EMPTY for :latest"
         required: false
         default: ""
 
@@ -36,9 +36,27 @@ jobs:
       - name: Work out which image to release
         run: |
           IMAGE="${{ inputs.image }}"
+
+          # Guard the input. A real image reference has no whitespace, so if the
+          # box came back with prose in it (the field description pasted in, say)
+          # treat it as "not provided" rather than handing it to kubectl - an
+          # invalid image only shows up 180s later as a rollout timeout.
+          case "$IMAGE" in
+            *[[:space:]]*)
+              echo "::warning::Ignoring unusable image input: '${IMAGE}'"
+              IMAGE="" ;;
+          esac
+
           if [ -z "$IMAGE" ]; then
             IMAGE="docker.io/${{ vars.DOCKERHUB_USERNAME }}/cicd-demo:latest"
           fi
+
+          # Fail loudly and immediately if it still is not a usable reference.
+          case "$IMAGE" in
+            */*:*) : ;;
+            *) echo "Not a valid image reference: '${IMAGE}'"; exit 1 ;;
+          esac
+
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "Releasing $IMAGE"
 
