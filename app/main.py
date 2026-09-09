@@ -1,5 +1,5 @@
 """
-CI/CD Demo App - deliberately tiny.
+CI/CD Demo App - deliberately tiny. this is the code that runs in the pod, and is what the pipeline deploys.
 
 The whole point of this app is to be BORING, so that in the video
 100% of the attention goes to the pipeline, not to the code.
@@ -49,7 +49,12 @@ PALETTE = {
 @app.get("/api/info")
 def info() -> dict:
     """Everything the video needs to prove, in one JSON object."""
-    return {"version": APP_VERSION, "color": APP_COLOR, "pod": POD_NAME, "greeting": "render auto-deploy verified"}
+    return {
+        "version": APP_VERSION,
+        "color": APP_COLOR,
+        "pod": POD_NAME,
+        "greeting": "render auto-deploy verified",
+    }
 
 
 @app.get("/api/add")
